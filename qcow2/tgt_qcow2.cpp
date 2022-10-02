@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "ublksrv_tgt.h"
-#include "qcow2_format.h"
 #include "qcow2.h"
+#include "qcow2_format.h"
+#include "ublksrv_tgt.h"
 
 #define HEADER_SIZE  512
 #define QCOW2_UNMAPPED   (u64)(-1)
@@ -308,7 +308,7 @@ again:
 				op == UBLK_IO_OP_WRITE);
 	} catch (MetaIoException &meta_error) {
 
-		co_io_job_submit_and_wait(tag);
+		//co_io_job_submit_and_wait(tag);
 
 		cqe = io->tgt_io_cqe;
 		io->tgt_io_cqe = NULL;
@@ -318,7 +318,7 @@ again:
 		if (ret < 0)
 			goto exit;
 	} catch (MetaUpdateException &meta_update_error) {
-		co_io_job_submit_and_wait(tag);
+		//co_io_job_submit_and_wait(tag);
 
 		cqe = io->tgt_io_cqe;
 		io->tgt_io_cqe = NULL;
@@ -360,7 +360,7 @@ queue_io:
 			ret = qcow2_queue_tgt_io(q, io_op, tag, mapped_start,
 					&exp_op);
 		} catch (MetaUpdateException &meta_error) {
-			co_io_job_submit_and_wait(tag);
+			//co_io_job_submit_and_wait(tag);
 			goto queue_io;
 		}
 		if (ret > 0) {

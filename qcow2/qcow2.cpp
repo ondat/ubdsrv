@@ -969,7 +969,7 @@ again:
 	try {
 		ret = m->flush(qs, ioc, m->get_offset(), m->get_buf_size());
 	} catch (MetaUpdateException &meta_update_error) {
-		co_io_job_submit_and_wait(tag);
+		//co_io_job_submit_and_wait(tag);
 		goto again;
 	}
 
@@ -1059,7 +1059,7 @@ again:
 		ret = top.flush(qs, ioc,
 				top.get_offset() + parent_blk_idx * 512, 512);
 	} catch (MetaUpdateException &meta_update_error) {
-		co_io_job_submit_and_wait(tag);
+		//co_io_job_submit_and_wait(tag);
 		goto again;
 	}
 
@@ -1187,7 +1187,7 @@ again:
 	try {
 		ret = m->zero_my_cluster(qs, ioc);
 	} catch (MetaUpdateException &meta_update_error) {
-		co_io_job_submit_and_wait(tag);
+		//co_io_job_submit_and_wait(tag);
 		goto again;
 	}
 
