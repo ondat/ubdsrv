@@ -3,40 +3,39 @@
 #ifndef UBLKSRV_INC_H
 #define UBLKSRV_INC_H
 
-#include <stdbool.h>
-#include <stdio.h>
-#include <errno.h>
-#include <assert.h>
-#include <stdlib.h>
-#include <stddef.h>
-#include <signal.h>
-#include <inttypes.h>
-#include <math.h>
-#include <getopt.h>
-#include <stdarg.h>
+#define RED     "\033[31m"      /* Red */
+#define GREEN   "\033[32m"      /* Green */
+#define RESET   "\033[0m"
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
-#include <sys/resource.h>
-#include <sys/mman.h>
-#include <sys/uio.h>
-#include <sys/eventfd.h>
+#include <assert.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <linux/fs.h>
-#include <unistd.h>
-#include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include <sched.h>
-#include <syslog.h>
 #include <signal.h>
-
-#include <sys/stat.h>
-#include <fcntl.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <dirent.h>
 #include <sys/prctl.h>
-#include <limits.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <syslog.h>
+#include <unistd.h>
 
 #include "liburing.h"
 
@@ -324,6 +323,18 @@ static inline struct ublksrv_io_desc *ublksrv_get_iod(struct ublksrv_queue *q, i
         return (struct ublksrv_io_desc *)
                 &(q->io_cmd_buf[tag * sizeof(struct ublksrv_io_desc)]);
 }
+
+#define pprintf(args, ...) \
+	do { \
+		char __name[16]; \
+		pthread_getname_np(pthread_self(), __name, 16); \
+		if (strcmp(__name, "ioworker") == 0) \
+			fprintf(stderr, RED   "[%-15s] %s " args RESET, __name, __func__, ##__VA_ARGS__); \
+		else if (strcmp(__name, "uring") == 0) \
+			fprintf(stderr, GREEN "[%-15s] %s " args RESET, __name, __func__, ##__VA_ARGS__); \
+		else \
+			fprintf(stderr, "[%-15s] %s " args, __name, __func__, ##__VA_ARGS__); \
+	} while (0);
 
 static inline __u64 build_user_data(unsigned tag, unsigned op,
 		unsigned tgt_data, unsigned is_target_io)

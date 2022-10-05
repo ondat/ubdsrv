@@ -2,8 +2,8 @@
 
 #include <config.h>
 
-#include "ublksrv_priv.h"
 #include "ublksrv_aio.h"
+#include "ublksrv_priv.h"
 
 /*
  * /dev/ublkbN shares same lifetime with the ublk io daemon:
@@ -183,6 +183,8 @@ static inline int ublksrv_queue_io_cmd(struct ublksrv_queue *q,
 		 UBLKSRV_NEED_COMMIT_RQ_COMP)))
 		return 0;
 
+	pprintf("%s UBLKSRV_NEED_GET_DATA=%i UBLKSRV_NEED_COMMIT_RQ_COMP=%i UBLKSRV_NEED_FETCH_RQ=%i\n",
+	 __func__, (io->flags & UBLKSRV_NEED_GET_DATA), (io->flags & UBLKSRV_NEED_COMMIT_RQ_COMP), (io->flags & UBLKSRV_NEED_FETCH_RQ));
 	if (io->flags & UBLKSRV_NEED_GET_DATA)
 		cmd_op = UBLK_IO_NEED_GET_DATA;
 	else if (io->flags & UBLKSRV_NEED_COMMIT_RQ_COMP)
@@ -227,6 +229,7 @@ static inline int ublksrv_queue_io_cmd(struct ublksrv_queue *q,
 
 int ublksrv_complete_io(struct ublksrv_queue *q, unsigned tag, int res)
 {
+	pprintf("%s\n", __func__);
 	struct ublk_io *io = &q->ios[tag];
 
 	ublksrv_mark_io_done(io, res);
@@ -272,6 +275,7 @@ int ublksrv_queue_handled_event(struct ublksrv_queue *q)
 		const int cnt = sizeof(uint64_t);
 
 		/* read has to be done, otherwise poll event won't be stopped */
+		pprintf("reading from efd=%d\n", q->efd);
 		if (read(q->efd, &data, cnt) != cnt)
 			syslog(LOG_ERR, "%s: read wrong bytes from eventfd\n",
 					__func__);
@@ -298,6 +302,7 @@ int ublksrv_queue_send_event(struct ublksrv_queue *q)
 		unsigned long long data = 1;
 		const int cnt = sizeof(uint64_t);
 
+		pprintf("writing to eventfd=%d\n", q->efd);
 		if (write(q->efd, &data, cnt) != cnt) {
 			syslog(LOG_ERR, "%s: read wrong bytes from eventfd\n",
 					__func__);
@@ -747,9 +752,11 @@ static inline void ublksrv_handle_tgt_cqe(struct ublksrv_queue *q,
 	}
 
 	if (is_eventfd_io(cqe->user_data)) {
+		pprintf("%s: is_eventfd_io=1\n", __func__);
 		if (q->tgt_ops->handle_event)
 			q->tgt_ops->handle_event(q);
 	} else {
+		pprintf("%s: is_eventfd_io=false\n", __func__);
 		if (q->tgt_ops->tgt_io_done)
 			q->tgt_ops->tgt_io_done(q, cqe);
 	}
@@ -770,9 +777,15 @@ static void ublksrv_handle_cqe(struct io_uring *r,
 			is_target_io(cqe->user_data),
 			is_eventfd_io(cqe->user_data),
 			(q->state & UBLKSRV_QUEUE_STOPPING));
+	pprintf("%s: res %d (qid %d tag %u cmd_op %u target %d event %d) stopping %d\n",
+			__func__, cqe->res, q->q_id, tag, cmd_op,
+			is_target_io(cqe->user_data),
+			is_eventfd_io(cqe->user_data),
+			(q->state & UBLKSRV_QUEUE_STOPPING));
 
 	/* Don't retrieve io in case of target io */
 	if (is_target_io(cqe->user_data)) {
+		pprintf("calling ublksrv_handle_tgt_cqe\n");
 		ublksrv_handle_tgt_cqe(q, cqe);
 		return;
 	}
@@ -792,8 +805,10 @@ static void ublksrv_handle_cqe(struct io_uring *r,
 	 * daemon can poll on both two rings.
 	 */
 	if (cqe->res == UBLK_IO_RES_OK) {
+		pprintf("UBLK_IO_RES_OK\n");
 		q->tgt_ops->handle_io_async(q, tag);
 	} else if (cqe->res == UBLK_IO_RES_NEED_GET_DATA) {
+		pprintf("UBLK_IO_RES_NEED_GET_DATA\n");
 		io->flags |= UBLKSRV_NEED_GET_DATA | UBLKSRV_IO_FREE;
 		ublksrv_queue_io_cmd(q, io, tag);
 	} else {
@@ -814,6 +829,7 @@ static int ublksrv_reap_events_uring(struct io_uring *r)
 	struct io_uring_cqe *cqe;
 	unsigned head;
 	int count = 0;
+	pprintf("\n");
 
 	io_uring_for_each_cqe(r, head, cqe) {
 		ublksrv_handle_cqe(r, cqe, NULL);
@@ -851,12 +867,15 @@ static void ublksrv_submit_aio_batch(struct ublksrv_queue *q)
 		struct ublksrv_aio_ctx *ctx = q->ctxs[i];
 		unsigned long data = 1;
 
+		pprintf("writing to efd=%d\n", ctx->efd);
 		write(ctx->efd, &data, 8);
 	}
 }
 
+
 int ublksrv_process_io(struct ublksrv_queue *q)
 {
+	pprintf("%s here\n", __func__);
 	int ret, reapped;
 	struct __kernel_timespec ts = {
 		.tv_sec = UBLKSRV_IO_IDLE_SECS,
@@ -875,10 +894,21 @@ int ublksrv_process_io(struct ublksrv_queue *q)
 	if (ublksrv_queue_is_done(q))
 		return -ENODEV;
 
+#if 1 // Hack
+	struct __kernel_timespec tshack = {
+		.tv_sec = 0,
+		.tv_nsec = 0
+        };
+	pprintf("  submit and wait\n");
+	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, &tshack, NULL);
+	pprintf("  submit and wait done\n");
+#else
 	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, tsp, NULL);
+#endif
 
 	ublksrv_reset_aio_batch(q);
 	reapped = ublksrv_reap_events_uring(&q->ring);
+	pprintf("reaped=%d\n", reapped);
 	ublksrv_submit_aio_batch(q);
 
 	if (q->tgt_ops->handle_io_background)
@@ -886,6 +916,9 @@ int ublksrv_process_io(struct ublksrv_queue *q)
 				io_uring_sq_ready(&q->ring));
 
 	ublksrv_log(LOG_INFO, "submit result %d, reapped %d stop %d idle %d",
+			ret, reapped, (q->state & UBLKSRV_QUEUE_STOPPING),
+			(q->state & UBLKSRV_QUEUE_IDLE));
+	pprintf("submit result %d, reapped %d stop %d idle %d\n",
 			ret, reapped, (q->state & UBLKSRV_QUEUE_STOPPING),
 			(q->state & UBLKSRV_QUEUE_IDLE));
 

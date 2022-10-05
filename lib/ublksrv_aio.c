@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 #include "ublksrv_aio.h"
+
 #include <sys/epoll.h>
 
 static inline void aio_log(const char *fmt, ...)
@@ -83,6 +84,7 @@ void ublksrv_aio_complete_worker(struct ublksrv_aio_ctx *ctx,
 		this_q = ublksrv_get_queue(ctx->dev,
 				ublksrv_aio_qid(completed->head->id));
 		move_to_queue_complete_list(ctx, this_q, completed);
+		pprintf("calling ublksrv_queue_send_event\n");
 		ublksrv_queue_send_event(this_q);
 		return;
 	}
@@ -107,6 +109,7 @@ void ublksrv_aio_complete_worker(struct ublksrv_aio_ctx *ctx,
 		}
 
 		move_to_queue_complete_list(ctx, this_q, &this);
+		pprintf("calling ublksrv_queue_send_event2\n", __func__);
 		ublksrv_queue_send_event(this_q);
 		aio_list_splice(&others, completed);
 	}
@@ -195,13 +198,16 @@ void ublksrv_aio_submit_req(struct ublksrv_aio_ctx *ctx,
 		struct ublksrv_queue *q, struct ublksrv_aio *req)
 {
 	unsigned long long data = 1;
+	pprintf("aadding to ctx->submit list\n");
 
 	pthread_spin_lock(&ctx->submit.lock);
 	aio_list_add(&ctx->submit.list, req);
 	pthread_spin_unlock(&ctx->submit.lock);
 
-	if (!ublksrv_aio_add_ctx_for_submit(q, ctx))
+	if (!ublksrv_aio_add_ctx_for_submit(q, ctx)) {
+		pprintf("writing to ctx->efd\n");
 		write(ctx->efd, &data, 8);
+	}
 }
 
 void ublksrv_aio_get_completed_reqs(struct ublksrv_aio_ctx *ctx,
@@ -225,10 +231,12 @@ void ublksrv_aio_handle_event(struct ublksrv_aio_ctx *ctx,
 	aio_list_init(&al);
 	pthread_spin_lock(&compl->lock);
 	aio_list_splice(&compl->list, &al);
+	pprintf("calling ublksrv_queue_handled_event\n");
 	ublksrv_queue_handled_event(q);
 	pthread_spin_unlock(&compl->lock);
 
 	while (req = aio_list_pop(&al)) {
+		pprintf("calling ublksrv_complete_io\n");
 		ublksrv_complete_io(q, ublksrv_aio_tag(req->id),
 				req->res);
 		ublksrv_aio_free_req(ctx, req);

@@ -116,6 +116,7 @@ static int demo_null_io_handler(struct ublksrv_ctrl_dev *ctrl_dev)
 		pthread_create(&info_array[i].thread, NULL,
 				demo_null_io_handler_fn,
 				&info_array[i]);
+		pthread_setname_np(&info_array[i].thread, "worker");
 	}
 
 	demo_null_set_parameters(ctrl_dev, dev);

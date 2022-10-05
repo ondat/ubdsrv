@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT or GPL-2.0-only
 
 #include <config.h>
-
-#include <poll.h>
-#include <sys/epoll.h>
 #include <errno.h>
 #include <error.h>
+#include <poll.h>
+#include <sys/epoll.h>
 
 #include "ublksrv.h"
 #include "ublksrv_aio.h"
@@ -258,6 +257,7 @@ static void *demo_event_uring_io_handler_fn(void *data)
 #define EPOLL_NR_EVENTS 1
 static void *demo_event_real_io_handler_fn(void *data)
 {
+	pthread_setname_np(pthread_self(), "ioworker");
 	struct ublksrv_aio_ctx *ctx = (struct ublksrv_aio_ctx *)data;
 
 	unsigned dev_id = ctx->dev->ctrl_dev->dev_info.dev_id;
@@ -283,11 +283,15 @@ static void *demo_event_real_io_handler_fn(void *data)
 
 		aio_list_init(&compl);
 
+		pprintf("submit worker\n");
 		ublksrv_aio_submit_worker(ctx, io_submit_worker, &compl);
 
+		pprintf("complete worker\n");
 		ublksrv_aio_complete_worker(ctx, &compl);
 
+		pprintf("io thread epoll wait...\n");
 		epoll_wait(epoll_fd, events, EPOLL_NR_EVENTS, -1);
+		pprintf("io thread epoll wait finished event on fd=%d\n", ctx->efd);
 	}
 
 	return NULL;
@@ -308,6 +312,7 @@ static void *demo_event_io_handler_fn(void *data)
 	unsigned short q_id = info->qid;
 	struct ublksrv_queue *q;
 	unsigned long long ev_data = 1;
+	pthread_setname_np(pthread_self(), "uring");
 
 	pthread_mutex_lock(&jbuf_lock);
 	ublksrv_json_write_queue_info(dev->ctrl_dev, jbuf, sizeof jbuf,
@@ -322,11 +327,78 @@ static void *demo_event_io_handler_fn(void *data)
 	}
 	info->q = q;
 
-	fprintf(stdout, "tid %d: ublk dev %d queue %d started\n", q->tid,
-			dev_id, q->q_id);
+	// Create an eventfd
+	int ring_efd = eventfd(0, 0);
+	if (ring_efd < 0) {
+		fprintf(stderr, "eventfs create failed");
+		return NULL;
+	}
+
+	fprintf(stderr, "created eventfd\n");
+
+	// Register eventfd with the ring
+	io_uring_register_eventfd(&q->ring, ring_efd);
+
+	pprintf("registered eventfd\n");
+
+	// Setup epoll instance to wait on eventfd
+	int epoll_fd = epoll_create(1);
+	if (epoll_fd < 0) {
+	        pprintf("failed to setup epoll\n");
+	        return NULL;
+	}
+
+	pprintf("created epoll\n");
+
+	struct epoll_event read_event;
+	read_event.events = EPOLLIN;
+	read_event.data.fd = ring_efd;
+	int ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ring_efd, &read_event);
+	if (ret) {
+		pprintf("failed to epoll_ctl\n");
+		return NULL;
+	}
+	pprintf("called epoll ctl\n");
+
+	int attempts = 0;
+	struct epoll_event events[EPOLL_NR_EVENTS];
 	do {
+
+		pprintf("calling ublksrv_process_io\n");
 		if (ublksrv_process_io(q) < 0)
 			break;
+
+		attempts = 0;
+
+poll:
+		pprintf("calling epoll with timeout = 2000ms\n");
+		do {
+			ret = epoll_wait(epoll_fd, events, EPOLL_NR_EVENTS, 2000);
+		} while (ret < 0 && errno == EINTR);
+
+		if (ret < 0) {
+			pprintf("epoll_wait returned %di %s", ret, strerror(errno));
+			return NULL;
+		}
+
+		if (ret == 0) {
+			++attempts;
+			if (attempts < 2)
+				goto poll;
+			else
+				pprintf("bailing out...\n");
+		}
+
+		if (ret) {
+			uint64_t data;
+			ret = eventfd_read(ring_efd, &data);
+			if (ret < 0) {
+				pprintf("eventfd_read returned %d\n", ring_efd);
+				return NULL;
+			}
+		}
+
+		pprintf("epoll returned %d\n", ret);
 	} while (1);
 
 	fprintf(stdout, "ublk dev %d queue %d exited\n", dev_id, q->q_id);
@@ -486,6 +558,7 @@ static int demo_init_tgt(struct ublksrv_dev *dev, int type, int argc,
 
 static int demo_handle_io_async(struct ublksrv_queue *q, int tag)
 {
+	pprintf("\n");
 	const struct ublksrv_io_desc *iod = ublksrv_get_iod(q, tag);
 	struct ublksrv_aio *req = ublksrv_aio_alloc_req(aio_ctx, 0);
 
@@ -499,6 +572,7 @@ static int demo_handle_io_async(struct ublksrv_queue *q, int tag)
 
 static void demo_handle_event(struct ublksrv_queue *q)
 {
+	pprintf("\n");
 	ublksrv_aio_handle_event(aio_ctx, q);
 }
 
