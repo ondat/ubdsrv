@@ -901,7 +901,7 @@ int ublksrv_process_io(struct ublksrv_queue *q)
         };
 	pprintf("  submit and wait\n");
 	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, &tshack, NULL);
-	pprintf("  submit and wait done\n");
+	pprintf("  submit and wait done submitted=%d\n", ret);
 #else
 	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, tsp, NULL);
 #endif
@@ -910,6 +910,14 @@ int ublksrv_process_io(struct ublksrv_queue *q)
 	reapped = ublksrv_reap_events_uring(&q->ring);
 	pprintf("reaped=%d\n", reapped);
 	ublksrv_submit_aio_batch(q);
+
+#if 1
+	// Calling ublksrv_reap_events_uring can cause us to enqueue more sqes which
+	// we need to reap
+	pprintf("  submit and wait2\n");
+	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, &tshack, NULL);
+	pprintf("  submit and wait2 done submitted=%d\n", ret);
+#endif
 
 	if (q->tgt_ops->handle_io_background)
 		q->tgt_ops->handle_io_background(q,

@@ -284,7 +284,8 @@ static void *demo_event_real_io_handler_fn(void *data)
 		aio_list_init(&compl);
 
 		pprintf("submit worker\n");
-		ublksrv_aio_submit_worker(ctx, io_submit_worker, &compl);
+		int dequeued = ublksrv_aio_submit_worker(ctx, io_submit_worker, &compl);
+		pprintf("dequeued %d\n", dequeued);
 
 		pprintf("complete worker\n");
 		ublksrv_aio_complete_worker(ctx, &compl);
@@ -350,55 +351,67 @@ static void *demo_event_io_handler_fn(void *data)
 
 	pprintf("created epoll\n");
 
-	struct epoll_event read_event;
-	read_event.events = EPOLLIN;
-	read_event.data.fd = ring_efd;
-	int ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ring_efd, &read_event);
+	struct epoll_event read_events[3];
+	read_events[0].events = EPOLLIN;
+	read_events[0].data.fd = ring_efd;
+
+	int ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ring_efd, &read_events[0]);
 	if (ret) {
-		pprintf("failed to epoll_ctl\n");
+		pprintf("failed to epoll_ctl ring_efd\n");
+		return NULL;
+	}
+
+	read_events[1].events = EPOLLIN;
+	read_events[1].data.fd = q->efd;
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, q->efd, &read_events[1]);
+	if (ret) {
+		pprintf("failed to epoll_ctl q->fd\n");
 		return NULL;
 	}
 	pprintf("called epoll ctl\n");
 
-	int attempts = 0;
-	struct epoll_event events[EPOLL_NR_EVENTS];
+	struct epoll_event events[2];
+	memset(events, 0, sizeof(struct epoll_event) * 2);
 	do {
 
 		pprintf("calling ublksrv_process_io\n");
 		if (ublksrv_process_io(q) < 0)
 			break;
 
-		attempts = 0;
-
-poll:
 		pprintf("calling epoll with timeout = 2000ms\n");
 		do {
-			ret = epoll_wait(epoll_fd, events, EPOLL_NR_EVENTS, 2000);
+			ret = epoll_wait(epoll_fd, events, 2, 30000);
 		} while (ret < 0 && errno == EINTR);
+		pprintf("epoll returned %d\n", ret);
 
 		if (ret < 0) {
-			pprintf("epoll_wait returned %di %s", ret, strerror(errno));
-			return NULL;
+			pprintf("UH OH epoll_wait returned %d %s", ret, strerror(errno));
+			break;
 		}
 
 		if (ret == 0) {
-			++attempts;
-			if (attempts < 2)
-				goto poll;
-			else
-				pprintf("bailing out...\n");
+			pprintf("got no work this time\n");
+			continue;
 		}
 
-		if (ret) {
-			uint64_t data;
-			ret = eventfd_read(ring_efd, &data);
-			if (ret < 0) {
-				pprintf("eventfd_read returned %d\n", ring_efd);
-				return NULL;
+		for (int n = 0; n < ret; ++n) {
+			pprintf("%d/%d\n", n, ret);
+			if (events[n].data.fd == q->efd) {
+				pprintf("got event on q->fd (%d), i.e. we have sqe's to submit\n", q->efd);
+				// We do the read(q->fd, ...) later on I think
+			} else if (events[n].data.fd == ring_efd) {
+				uint64_t data;
+				pprintf("got ring_efd event (%d), i.e. we got some IO\n", ring_efd);
+				int ret2 = eventfd_read(ring_efd, &data);
+				if (ret2 < 0) {
+					pprintf("eventfd_read returned %d\n", ring_efd);
+					return NULL;
+				}
+				pprintf("cleared ring_efd (%d)\n", ring_efd);
+			} else {
+				pprintf("DA FUQ\n");
 			}
 		}
-
-		pprintf("epoll returned %d\n", ret);
 	} while (1);
 
 	fprintf(stdout, "ublk dev %d queue %d exited\n", dev_id, q->q_id);

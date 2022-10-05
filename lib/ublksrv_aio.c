@@ -98,6 +98,7 @@ void ublksrv_aio_complete_worker(struct ublksrv_aio_ctx *ctx,
 		this_q = ublksrv_get_queue(ctx->dev,
 				ublksrv_aio_qid(completed->head->id));
 
+		int count = 0;
 		while (req = aio_list_pop(completed)) {
 			struct ublksrv_queue *q = ublksrv_get_queue(ctx->dev,
 					ublksrv_aio_qid(req->id));
@@ -106,10 +107,13 @@ void ublksrv_aio_complete_worker(struct ublksrv_aio_ctx *ctx,
 				aio_list_add(&this, req);
 			else
 				aio_list_add(&others, req);
+
+			pprintf("pop\n");
+			++count;
 		}
 
 		move_to_queue_complete_list(ctx, this_q, &this);
-		pprintf("calling ublksrv_queue_send_event2\n", __func__);
+		pprintf("calling ublksrv_queue_send_event2 ios=%d\n",  count);
 		ublksrv_queue_send_event(this_q);
 		aio_list_splice(&others, completed);
 	}
