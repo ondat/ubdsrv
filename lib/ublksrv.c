@@ -257,7 +257,7 @@ static inline int __ublksrv_queue_event(struct ublksrv_queue *q)
 			return -1;
 		}
 
-		pprintf("writing to eventfd q->efd=%d\n", q->efd);
+		pprintf("queuing POLLIN SQE to command ring q->efd=%d\n", q->efd);
 		io_uring_prep_poll_add(sqe, q->efd, POLLIN);
 		io_uring_sqe_set_data64(sqe, user_data);
 		q->tgt_io_inflight += 1;
@@ -303,7 +303,7 @@ int ublksrv_queue_send_event(struct ublksrv_queue *q)
 		unsigned long long data = 1;
 		const int cnt = sizeof(uint64_t);
 
-		pprintf("writing to eventfd=%d\n", q->efd);
+		pprintf("writing to q->efd fd=%d\n", q->efd);
 		if (write(q->efd, &data, cnt) != cnt) {
 			syslog(LOG_ERR, "%s: read wrong bytes from eventfd\n",
 					__func__);
@@ -868,7 +868,7 @@ static void ublksrv_submit_aio_batch(struct ublksrv_queue *q)
 		struct ublksrv_aio_ctx *ctx = q->ctxs[i];
 		unsigned long data = 1;
 
-		pprintf("writing to efd=%d\n", ctx->efd);
+		pprintf("writing to cfx->efd=%d\n", ctx->efd);
 		write(ctx->efd, &data, 8);
 	}
 }

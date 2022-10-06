@@ -324,6 +324,7 @@ static inline struct ublksrv_io_desc *ublksrv_get_iod(struct ublksrv_queue *q, i
                 &(q->io_cmd_buf[tag * sizeof(struct ublksrv_io_desc)]);
 }
 
+#define DEBUG_PRINTF
 #ifdef DEBUG_PRINTF
 
 #define pprintf(args, ...) \

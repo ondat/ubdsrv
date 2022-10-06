@@ -378,7 +378,7 @@ static void *demo_event_io_handler_fn(void *data)
 		if (ublksrv_process_io(q) < 0)
 			break;
 
-		pprintf("calling epoll with timeout = 2000ms\n");
+		pprintf("calling epoll with timeout\n");
 		do {
 			ret = epoll_wait(epoll_fd, events, 2, 10000);
 		} while (ret < 0 && errno == EINTR);
