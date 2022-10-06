@@ -324,6 +324,8 @@ static inline struct ublksrv_io_desc *ublksrv_get_iod(struct ublksrv_queue *q, i
                 &(q->io_cmd_buf[tag * sizeof(struct ublksrv_io_desc)]);
 }
 
+#ifdef DEBUG_PRINTF
+
 #define pprintf(args, ...) \
 	do { \
 		char __name[16]; \
@@ -335,6 +337,14 @@ static inline struct ublksrv_io_desc *ublksrv_get_iod(struct ublksrv_queue *q, i
 		else \
 			fprintf(stderr, "[%-15s] %s " args, __name, __func__, ##__VA_ARGS__); \
 	} while (0);
+
+#else
+
+#define pprintf(arrs, ...)	\
+	do {			\
+	} while (0);
+
+#endif
 
 static inline __u64 build_user_data(unsigned tag, unsigned op,
 		unsigned tgt_data, unsigned is_target_io)

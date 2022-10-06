@@ -257,6 +257,7 @@ static inline int __ublksrv_queue_event(struct ublksrv_queue *q)
 			return -1;
 		}
 
+		pprintf("writing to eventfd q->efd=%d\n", q->efd);
 		io_uring_prep_poll_add(sqe, q->efd, POLLIN);
 		io_uring_sqe_set_data64(sqe, user_data);
 		q->tgt_io_inflight += 1;
@@ -916,7 +917,7 @@ int ublksrv_process_io(struct ublksrv_queue *q)
 	// we need to reap
 	pprintf("  submit and wait2\n");
 	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, &tshack, NULL);
-	pprintf("  submit and wait2 done submitted=%d\n", ret);
+	pprintf("  submit and wait2 done submitted=%d %s\n", ret, strerror(ret));
 #endif
 
 	if (q->tgt_ops->handle_io_background)

@@ -361,14 +361,14 @@ static void *demo_event_io_handler_fn(void *data)
 		return NULL;
 	}
 
-	read_events[1].events = EPOLLIN;
-	read_events[1].data.fd = q->efd;
-	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, q->efd, &read_events[1]);
-	if (ret) {
-		pprintf("failed to epoll_ctl q->fd\n");
-		return NULL;
-	}
-	pprintf("called epoll ctl\n");
+	//read_events[1].events = EPOLLIN;
+	//read_events[1].data.fd = q->efd;
+	//ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, q->efd, &read_events[1]);
+	//if (ret) {
+	//	pprintf("failed to epoll_ctl q->fd\n");
+	//	return NULL;
+	//}
+	//pprintf("called epoll ctl\n");
 
 	struct epoll_event events[2];
 	memset(events, 0, sizeof(struct epoll_event) * 2);
@@ -380,7 +380,7 @@ static void *demo_event_io_handler_fn(void *data)
 
 		pprintf("calling epoll with timeout = 2000ms\n");
 		do {
-			ret = epoll_wait(epoll_fd, events, 2, 30000);
+			ret = epoll_wait(epoll_fd, events, 2, 10000);
 		} while (ret < 0 && errno == EINTR);
 		pprintf("epoll returned %d\n", ret);
 
