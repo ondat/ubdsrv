@@ -5,6 +5,9 @@
 
 #define RED     "\033[31m"      /* Red */
 #define GREEN   "\033[32m"      /* Green */
+#define BLUE    "\033[34m"
+#define YELLOW  "\033[33m"
+
 #define RESET   "\033[0m"
 
 #include <assert.h>
@@ -324,17 +327,21 @@ static inline struct ublksrv_io_desc *ublksrv_get_iod(struct ublksrv_queue *q, i
                 &(q->io_cmd_buf[tag * sizeof(struct ublksrv_io_desc)]);
 }
 
-#define DEBUG_PRINTF
+//#define DEBUG_PRINTF
 #ifdef DEBUG_PRINTF
 
 #define pprintf(args, ...) \
 	do { \
 		char __name[16]; \
 		pthread_getname_np(pthread_self(), __name, 16); \
-		if (strcmp(__name, "ioworker") == 0) \
+		if (strcmp(__name, "iouring0") == 0) \
 			fprintf(stderr, RED   "[%-15s] %s " args RESET, __name, __func__, ##__VA_ARGS__); \
-		else if (strcmp(__name, "uring") == 0) \
+		else if (strcmp(__name, "iouring1") == 0) \
 			fprintf(stderr, GREEN "[%-15s] %s " args RESET, __name, __func__, ##__VA_ARGS__); \
+		else if (strcmp(__name, "iouring2") == 0) \
+			fprintf(stderr, BLUE "[%-15s] %s " args RESET, __name, __func__, ##__VA_ARGS__); \
+		else if (strcmp(__name, "iouring3") == 0) \
+			fprintf(stderr, YELLOW "[%-15s] %s " args RESET, __name, __func__, ##__VA_ARGS__); \
 		else \
 			fprintf(stderr, "[%-15s] %s " args, __name, __func__, ##__VA_ARGS__); \
 	} while (0);

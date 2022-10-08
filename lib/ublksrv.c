@@ -284,8 +284,11 @@ int ublksrv_queue_handled_event(struct ublksrv_queue *q)
 		 * event needs to be issued immediately, since other io may rely
 		 * it
 		 */
-		if (!__ublksrv_queue_event(q))
-			io_uring_submit_and_wait(&q->ring, 0);
+		if (!__ublksrv_queue_event(q)) {
+			pprintf("calling io_uring_submit_and_wait\n");
+			int x = io_uring_submit_and_wait(&q->ring, 0);
+			pprintf("called io_uring_submit_and_wait submit=%d\n", x);
+		}
 	}
 	return 0;
 }
@@ -604,8 +607,12 @@ struct ublksrv_queue *ublksrv_queue_init(struct ublksrv_dev *dev,
 	q->private_data = queue_data;
 
 
-	if (ctrl_dev->queues_cpuset)
+	if (ctrl_dev->queues_cpuset) {
+		fprintf(stderr, "setting up sched affinity\n");
 		ublksrv_set_sched_affinity(dev, q_id);
+	} else {
+		fprintf(stderr, "not setting up sched affinity\n");
+	}
 
 	setpriority(PRIO_PROCESS, getpid(), -20);
 
@@ -914,9 +921,14 @@ int ublksrv_process_io(struct ublksrv_queue *q)
 
 #if 1
 	// Calling ublksrv_reap_events_uring can cause us to enqueue more sqes which
-	// we need to reap
+	// we need to reap. We should probably just submit here. ublksrv_reap_events_uring
+	// enqueues a POLLIN SQE for the "notify command ring we have completed IO" eventfd.
+	// We actually call io_submit_and_wait() immediately after enqueuing this. The
+	// problem is after that we need to call it again as ublksrv_submit_aio_batch enques
+	// a bunch of SQE's for our completed IO work.
 	pprintf("  submit and wait2\n");
-	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, &tshack, NULL);
+	//ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, &tshack, NULL);
+	ret = io_uring_submit(&q->ring);
 	pprintf("  submit and wait2 done submitted=%d %s\n", ret, strerror(ret));
 #endif
 
