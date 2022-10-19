@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "qcow2.h"
-#include "qcow2_format.h"
 #include "ublksrv_tgt.h"
+#include "qcow2_format.h"
+#include "qcow2.h"
 
 #define HEADER_SIZE  512
 #define QCOW2_UNMAPPED   (u64)(-1)
@@ -88,6 +88,7 @@ static int qcow2_init_tgt(struct ublksrv_dev *dev, int type, int argc, char
 	p.basic.chunk_sectors = 1 << (be32_to_cpu(header->cluster_bits) - 9);
 	tgt->tgt_ring_depth = info->queue_depth * 4;
 	tgt->extra_ios = QCOW2_PARA::META_MAX_TAGS;
+	tgt->iowq_max_workers[0] = 1;
 	tgt->nr_fds = 1;
 	tgt->fds[1] = fd;
 	dev->target_data = qs = make_qcow2state(file, dev);
@@ -296,6 +297,7 @@ static co_io_job __qcow2_handle_io_async(struct ublksrv_queue *q,
 	struct io_uring_cqe *cqe;
 	int ret = 0;
 	unsigned int op = ublksrv_get_op(iod);
+	bool wait;
 
 	qcow2_io_log("%s: tag %d, ublk op %x virt %llx/%u\n",
 			__func__, tag, op, start, (iod->nr_sectors << 9));
@@ -306,19 +308,15 @@ again:
 	try {
 		mapped_start = qs->cluster_map.map_cluster(ioc, start,
 				op == UBLK_IO_OP_WRITE);
+		wait = false;
 	} catch (MetaIoException &meta_error) {
-
-		//co_io_job_submit_and_wait(tag);
-
-		cqe = io->tgt_io_cqe;
-		io->tgt_io_cqe = NULL;
-		ret = qcow2_meta_io_done(q, cqe);
-		if (ret == -EAGAIN)
-			goto again;
-		if (ret < 0)
-			goto exit;
+		wait = true;
 	} catch (MetaUpdateException &meta_update_error) {
-		//co_io_job_submit_and_wait(tag);
+		wait = true;
+	}
+
+	if (wait) {
+		co_io_job_submit_and_wait(tag);
 
 		cqe = io->tgt_io_cqe;
 		io->tgt_io_cqe = NULL;
@@ -327,7 +325,6 @@ again:
 			goto again;
 		if (ret < 0)
 			goto exit;
-		goto again;
 	}
 
 	qcow2_io_log("%s: tag %d, ublk op %x virt %llx/%u to host %llx\n",
@@ -359,10 +356,16 @@ queue_io:
 		try {
 			ret = qcow2_queue_tgt_io(q, io_op, tag, mapped_start,
 					&exp_op);
+			wait = false;
 		} catch (MetaUpdateException &meta_error) {
-			//co_io_job_submit_and_wait(tag);
+			wait = true;
+		}
+
+		if (wait) {
+			co_io_job_submit_and_wait(tag);
 			goto queue_io;
 		}
+
 		if (ret > 0) {
 			u32 cqe_op;
 			u64 cluster_start = mapped_start &
@@ -449,8 +452,23 @@ static void qcow2_handle_io_bg(struct ublksrv_queue *q, int nr_queued_io)
 
 	meta_log("%s %d, queued io %d\n", __func__, __LINE__, nr_queued_io);
 	qs->kill_slices(q);
-
+again:
 	qs->meta_flushing.run_flush(q, nr_queued_io);
+
+	if (!nr_queued_io && !qs->meta_flushing.is_flushing()) {
+		if (qs->has_dirty_slice())
+			goto again;
+	}
+}
+
+static void qcow2_idle(struct ublksrv_queue *q, bool enter)
+{
+	Qcow2State *qs = dev_to_qcow2state(q->dev);
+
+	if (!enter)
+		return;
+
+	qs->shrink_cache();
 }
 
 struct ublksrv_tgt_type  qcow2_tgt_type = {
@@ -460,6 +478,7 @@ struct ublksrv_tgt_type  qcow2_tgt_type = {
 	.usage_for_add	=  qcow2_usage_for_add,
 	.init_tgt = qcow2_init_tgt,
 	.deinit_tgt	=  qcow2_deinit_tgt,
+	.idle_fn	=  qcow2_idle,
 	.type	= UBLKSRV_TGT_TYPE_QCOW2,
 	.name	=  "qcow2",
 };

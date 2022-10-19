@@ -517,6 +517,32 @@ static int ublksrv_setup_eventfd(struct ublksrv_queue *q)
 	return 0;
 }
 
+static void ublksrv_queue_adjust_uring_io_wq_workers(struct ublksrv_queue *q)
+{
+	struct ublksrv_dev *dev = q->dev;
+	unsigned int val[2] = {0, 0};
+	int ret;
+
+	if (!dev->tgt.iowq_max_workers[0] && !dev->tgt.iowq_max_workers[1])
+		return;
+
+	ret = io_uring_register_iowq_max_workers(&q->ring, val);
+	if (ret)
+		syslog(LOG_ERR, "%s: register iowq max workers failed %d\n",
+				__func__, ret);
+
+	if (!dev->tgt.iowq_max_workers[0])
+		dev->tgt.iowq_max_workers[0] = val[0];
+	if (!dev->tgt.iowq_max_workers[1])
+		dev->tgt.iowq_max_workers[1] = val[1];
+
+	ret = io_uring_register_iowq_max_workers(&q->ring,
+			dev->tgt.iowq_max_workers);
+	if (ret)
+		syslog(LOG_ERR, "%s: register iowq max workers failed %d\n",
+				__func__, ret);
+}
+
 struct ublksrv_queue *ublksrv_queue_init(struct ublksrv_dev *dev,
 		unsigned short q_id, void *queue_data)
 {
@@ -603,6 +629,8 @@ struct ublksrv_queue *ublksrv_queue_init(struct ublksrv_dev *dev,
 	if (prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0) != 0)
 		syslog(LOG_INFO, "ublk dev %d queue %d set_io_flusher failed",
 			q->dev->ctrl_dev->dev_info.dev_id, q->q_id);
+
+	ublksrv_queue_adjust_uring_io_wq_workers(q);
 
 	q->private_data = queue_data;
 
@@ -854,12 +882,33 @@ static void ublksrv_queue_discard_io_pages(struct ublksrv_queue *q)
 	unsigned int io_buf_size = cdev->dev_info.max_io_buf_bytes;
 	int i = 0;
 
+	for (i = 0; i < q->q_depth; i++)
+		madvise(q->ios[i].buf_addr, io_buf_size, MADV_DONTNEED);
+}
+
+static void ublksrv_queue_idle_enter(struct ublksrv_queue *q)
+{
 	if (q->state & UBLKSRV_QUEUE_IDLE)
 		return;
 
-	for (i = 0; i < q->q_depth; i++)
-		madvise(q->ios[i].buf_addr, io_buf_size, MADV_DONTNEED);
+	ublksrv_log(LOG_INFO, "dev%d-q%d: enter idle %x\n",
+			q->dev->ctrl_dev->dev_info.dev_id, q->q_id, q->state);
+	ublksrv_queue_discard_io_pages(q);
 	q->state |= UBLKSRV_QUEUE_IDLE;
+
+	if (q->tgt_ops->idle_fn)
+		q->tgt_ops->idle_fn(q, true);
+}
+
+static inline void ublksrv_queue_idle_exit(struct ublksrv_queue *q)
+{
+	if (q->state & UBLKSRV_QUEUE_IDLE) {
+		ublksrv_log(LOG_INFO, "dev%d-q%d: exit idle %x\n",
+			q->dev->ctrl_dev->dev_info.dev_id, q->q_id, q->state);
+		q->state &= ~UBLKSRV_QUEUE_IDLE;
+		if (q->tgt_ops->idle_fn)
+			q->tgt_ops->idle_fn(q, false);
+	}
 }
 
 static void ublksrv_reset_aio_batch(struct ublksrv_queue *q)
@@ -946,10 +995,11 @@ int ublksrv_process_io(struct ublksrv_queue *q)
 	if ((q->state & UBLKSRV_QUEUE_STOPPING))
 		ublksrv_kill_eventfd(q);
 	else {
-		if (ret == -ETIME && reapped == 0)
-			ublksrv_queue_discard_io_pages(q);
-		else if ((q->state & UBLKSRV_QUEUE_IDLE))
-			q->state &= ~UBLKSRV_QUEUE_IDLE;
+		if (ret == -ETIME && reapped == 0 &&
+				!io_uring_sq_ready(&q->ring))
+			ublksrv_queue_idle_enter(q);
+		else
+			ublksrv_queue_idle_exit(q);
 	}
 
 	return reapped;

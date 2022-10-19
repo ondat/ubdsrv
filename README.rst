@@ -1,9 +1,13 @@
-Userspace block driver(ublk)
 
-1 Introduction
+============================
+Userspace block driver(ublk)
+============================
+
+Introduction
+============
 
 This is the userspace daemon part(ublksrv) of the ublk framework, the other
-part is ublk blk-mq block driver[1] which supports multiple queue.
+part is ``ublk driver`` [#userspace]_  which supports multiple queue.
 
 The two parts communicate by io_uring's IORING_OP_URING_CMD with one
 per-queue shared cmd buffer for storing io command, and the buffer is
@@ -30,7 +34,7 @@ io request.
 So far, the ublk driver needs to copy io request pages into userspace buffer
 (pages) first for write before notifying the request to ublksrv, and copy
 userspace buffer(pages) to the io request pages after ublksrv handles
-READ. Also looks linux-mm can't support zero copy for this case yet[2].
+READ. Also looks linux-mm can't support zero copy for this case yet. [#zero_copy]_
 
 More ublk targets will be added with this framework in future even though only
 ublk-loop and ublk-null are implemented now.
@@ -39,16 +43,21 @@ libublksrv is also generated, and it helps to integrate ublk into existed
 project. One example of demo_null is provided for how to make a ublk
 device over libublksrv.
 
-2 Quick start
+Quick start
+===========
 
-2.1 how to build ublksrv:
+how to build ublksrv:
+--------------------
 
   autoreconf -i
+
   ./configure
+
   make
 
-'./configure' requires liburing 2.2 package installed, if liburing 2.2 isn't
-available in your distribution, please configure via the following command:
+note: './configure' requires liburing 2.2 package installed, if liburing 2.2
+isn't available in your distribution, please configure via the following
+command, or refer to ``build_with_liburing_src`` [#build_with_liburing_src]_
 
   PKG_CONFIG_PATH=${LIBURING_DIR} \
   ./configure \
@@ -60,72 +69,106 @@ and LIBURING_DIR points to directory of liburing source code, and liburing
 needs to be built before running above commands. Also IORING_SETUP_SQE128
 has to be supported in the liburing source.
 
-2.2 help
+help
+----
 
 - ublk help
 
-2.3 add one ublk-null disk
+add one ublk-null disk
+----------------------
+
 - ublk add -t null
 
-2.4 add one ublk-loop disk
+
+add one ublk-loop disk
+----------------------
+
 - ublk add -t loop -f /dev/vdb
+
 or
+
 - ublk add -t loop -f 1.img
 
-2.5 remove one ublk disk
+
+add one qcow2 disk
+------------------
+
+- ublk add -t qcow2 -f test.qcow2
+
+note: qcow2 support is experimental, see details in qcow2 status [#qcow2_status]_
+and readme [#qcow2_readme]_
+
+
+remove one ublk disk
+--------------------
+
 - ublk del -n 0		#remove /dev/ublkb0
+
 - ublk del -a		#remove all ublk devices
 
-2.6 list ublk devices
+list ublk devices
+---------------------
+
 - ublk list
+
 - ublk list -v	#with all device info dumped
 
-3 build
 
-3.1 run 'make' directly
+test
+====
 
-3.2 dependency
-1) liburing with IORING_SETUP_SQE128 support
-
-2) linux kernel v5.19(IORING_SETUP_SQE128 support)
-
-3) linux kernel v5.20 with ublk kernel driver(drivers/block/ublk_drv.c)
-merged
-
-4 test
-4.1 run all built tests
+run all built tests
+-------------------
 
 make test T=all
 
-4.2 run test group
+
+run test group
+--------------
 
 make test T=null
+
 make test T=loop
+
 make test T=generic
 
-4.3 run single test
+
+run single test
+---------------
 
 make test T=generic/001
+
 make test T=null/001
+
 make test T=loop/001
 ...
 
-4.4 run specified tests or test groups
+run specified tests or test groups
+----------------------------------
 
 make test T=generic:loop/001:null
 
 
-5 License
+License
+=======
 
-nlohmann(include/nlohmann/json.hpp) is from [3], which is covered by MIT
-license.
+nlohmann(include/nlohmann/json.hpp) is from [#nlohmann]_, which is covered
+by MIT license.
 
 The library functions (all code in lib/ directory and include/ublksrv.h)
 are covered by dual licensed LGPL and MIT, see COPYING.LGPL and LICENSE.
 
+qcow2 target code is covered by GPL-2.0, see COPYING.
+
 All other source code are covered by dual licensed GPL and MIT, see
 COPYING and LICENSE.
 
-[1] https://lore.kernel.org/linux-block/20220509092312.254354-1-ming.lei@redhat.com/
-[2] https://lore.kernel.org/all/20220318095531.15479-1-xiaoguang.wang@linux.alibaba.com/
-[3] https://github.com/nlohmann/json
+References
+==========
+
+.. [#ublk_driver] https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/block/ublk_drv.c?h=v6.0
+.. [#zero_copy] https://lore.kernel.org/all/20220318095531.15479-1-xiaoguang.wang@linux.alibaba.com/
+.. [#nlohmann] https://github.com/nlohmann/json
+.. [#qcow2_status] https://github.com/ming1/ubdsrv/blob/master/qcow2/STATUS.rst
+.. [#qcow2_readme] https://github.com/ming1/ubdsrv/blob/master/qcow2/README.rst
+.. [#build_with_liburing_src] https://github.com/ming1/ubdsrv/blob/master/build_with_liburing_src

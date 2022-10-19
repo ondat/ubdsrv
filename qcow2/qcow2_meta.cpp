@@ -11,6 +11,10 @@
 Qcow2Meta::Qcow2Meta(Qcow2Header &h, u64 off, u32 sz, const char *name, u32 f):
 	offset(off), buf_sz(sz), header(h), flags(f), refcnt(2)
 {
+	//used for implementing slice's ->reset() only
+	if (f & QCOW2_META_DONT_ALLOC_BUF)
+		return;
+
 	if (posix_memalign((void **)&addr, getpagesize(), sz))
 		syslog(LOG_ERR, "allocate memory %d bytes failed, %s\n",
 				sz, name);
@@ -38,6 +42,9 @@ Qcow2Meta::~Qcow2Meta()
 	qcow2_log("%s: destructed, obj %p flags %x off %lx ref %d\n",
 			id, this, flags, offset, refcnt);
 #endif
+	if (flags & QCOW2_META_DONT_ALLOC_BUF)
+		return;
+
 	if (!is_top_meta() && (get_dirty(-1) || is_flushing() ||
 				(!get_update() && !get_evicted()))) {
 		qcow2_log("BUG %s: obj %p flags %x off %lx\n",
@@ -555,20 +562,6 @@ Qcow2SliceMeta::Qcow2SliceMeta(Qcow2State &qs, u64 off, u32 buf_sz,
 }
 
 Qcow2SliceMeta::~Qcow2SliceMeta() {
-	unsigned queues = header.qs.dev->ctrl_dev->dev_info.nr_hw_queues;
-
-#ifdef QCOW2_CACHE_DEBUG
-	qcow2_log("slice meta %llx/%p/%d freed\n", offset, addr, buf_sz);
-#endif
-	meta_log("%s: %p off %llx\n", __func__, this, get_offset());
-
-	//Tell the whole world, I am leaving
-	for (int i = 0; i < queues; i++) {
-		struct ublksrv_queue *q = ublksrv_get_queue(header.qs.dev, i);
-
-		wakeup_all(q, -1);
-	}
-
 #ifdef DEBUG_QCOW2_META_VALIDATE
 	free(validate_addr);
 #endif
@@ -793,6 +786,57 @@ exit:
 	return;
 }
 
+void Qcow2SliceMeta::wait_clusters(Qcow2State &qs,
+		const qcow2_io_ctx_t &ioc)
+{
+	unsigned cnt = 0;
+	for (int i = 0; i < get_nr_entries(); i++) {
+		u64 entry = get_entry(i);
+
+		if (entry) {
+			u64 cluster_off;
+
+			//mapping meta means this is one l2 table, otherwise
+			//it is one refcount block table
+			if (is_mapping_meta())
+				cluster_off = entry & L1E_OFFSET_MASK;
+			else
+				cluster_off = virt_offset() + (u64)i << qs.header.cluster_bits;
+
+			 Qcow2ClusterState *s = qs.cluster_allocator.
+				 get_cluster_state(cluster_off);
+
+			if (s == nullptr)
+				continue;
+
+			if (s->get_state() < QCOW2_ALLOC_ZEROED) {
+				s->add_waiter(ioc.get_tag());
+				throw MetaUpdateException();
+			}
+		}
+	}
+}
+
+void Qcow2SliceMeta::reclaim_me()
+{
+	unsigned queues = header.qs.dev->ctrl_dev->dev_info.nr_hw_queues;
+
+	meta_log("%s: %p off %llx flags %x\n", __func__,
+			this, get_offset(), flags);
+
+	header.qs.remove_slice_from_evicted_list(this);
+
+	meta_log("%s: %p off %llx\n", __func__, this, get_offset());
+
+	//Tell the whole world, I am leaving
+	for (int i = 0; i < queues; i++) {
+		struct ublksrv_queue *q = ublksrv_get_queue(header.qs.dev, i);
+
+		wakeup_all(q, -1);
+	}
+	header.qs.reclaim_slice(this);
+}
+
 Qcow2RefcountBlock::Qcow2RefcountBlock(Qcow2State &qs, u64 off, u32 p_idx, u32 f):
 	Qcow2SliceMeta(qs, off, QCOW2_PARA::REFCOUNT_BLK_SLICE_BYTES,
 			typeid(*this).name(), p_idx, f),
@@ -800,6 +844,27 @@ Qcow2RefcountBlock::Qcow2RefcountBlock(Qcow2State &qs, u64 off, u32 p_idx, u32 f
 {
 	entry_bits_order = qs.header.refcount_order;
 	meta_log("rb meta %p %llx -> %llx \n", this, virt_offset(), off);
+}
+
+
+void Qcow2RefcountBlock::reset(Qcow2State &qs, u64 off, u32 p_idx, u32 f)
+{
+	Qcow2RefcountBlock tmp(qs, off, p_idx, f | QCOW2_META_DONT_ALLOC_BUF);
+
+	qcow2_assert(refcnt == 0);
+
+	offset = tmp.get_offset();
+	flags  = tmp.get_flags() & ~QCOW2_META_DONT_ALLOC_BUF;
+	refcnt = tmp.read_ref();
+
+	meta_log("%s: %p refcnt %d flags %x offset %lx \n",
+			__func__, this, refcnt, flags, offset);
+
+	next_free_idx = tmp.get_next_free_idx();
+
+	parent_idx = tmp.parent_idx;
+
+	dirty_start_idx = tmp.dirty_start_idx;
 }
 
 u64  Qcow2RefcountBlock::get_entry(u32 idx) {
@@ -813,30 +878,6 @@ void Qcow2RefcountBlock::set_entry(u32 idx, u64 val) {
 		qcow2_log("BUG %s: obj %p flags %x off %lx\n",
 				__func__, this, flags, offset);
 		qcow2_assert(0);
-	}
-}
-
-void Qcow2RefcountBlock::wait_clusters(Qcow2State &qs,
-		const qcow2_io_ctx_t &ioc)
-{
-	unsigned cnt = 0;
-	for (int i = 0; i < get_nr_entries(); i++) {
-		u64 entry = get_entry(i);
-
-		if (entry) {
-			u64 cluster_off = virt_offset() + (u64)i <<
-				qs.header.cluster_bits;
-			 Qcow2ClusterState *s = qs.cluster_allocator.
-				 get_cluster_state(cluster_off);
-
-			if (s == nullptr)
-				continue;
-
-			if (s->get_state() < QCOW2_ALLOC_ZEROED) {
-				s->add_waiter(ioc.get_tag());
-				throw MetaUpdateException();
-			}
-		}
 	}
 }
 
@@ -867,8 +908,6 @@ int Qcow2RefcountBlock::flush(Qcow2State &qs, const qcow2_io_ctx_t &ioc,
 
 Qcow2RefcountBlock::~Qcow2RefcountBlock()
 {
-	meta_log("%s: %p off %llx\n", __func__, this, get_offset());
-	header.qs.cluster_allocator.remove_slice_from_evicted_list(this);
 }
 
 void Qcow2RefcountBlock::get_dirty_range(u64 *start, u64 *end)
@@ -917,10 +956,28 @@ Qcow2L2Table::Qcow2L2Table(Qcow2State &qs, u64 off, u32 p_idx, u32 f):
         meta_log("l2 meta %p %llx -> %llx \n", this, virt_offset(), off);
 }
 
+void Qcow2L2Table::reset(Qcow2State &qs, u64 off, u32 p_idx, u32 f)
+{
+	Qcow2L2Table tmp(qs, off, p_idx, f | QCOW2_META_DONT_ALLOC_BUF);
+
+	qcow2_assert(refcnt == 0);
+
+	offset = tmp.get_offset();
+	flags = tmp.get_flags() & ~QCOW2_META_DONT_ALLOC_BUF;
+	refcnt = tmp.read_ref();
+
+	meta_log("%s: %p refcnt %d flags %x offset %lx \n",
+			__func__, this, refcnt, flags, offset);
+
+	next_free_idx = tmp.get_next_free_idx();
+
+	parent_idx = tmp.parent_idx;
+
+	tmp.get_dirty_range(&dirty_start, &dirty_end);
+}
+
 Qcow2L2Table::~Qcow2L2Table()
 {
-	meta_log("%s: %p off %llx\n", __func__, this, get_offset());
-	header.qs.cluster_map.remove_slice_from_evicted_list(this);
 }
 
 void Qcow2L2Table::io_done(Qcow2State &qs, struct ublksrv_queue *q,
@@ -959,29 +1016,6 @@ void Qcow2L2Table::set_entry(u32 idx, u64 val) {
 		dirty_start = val;
 	if (val > dirty_end)
 		dirty_end = val;
-}
-
-void Qcow2L2Table::wait_clusters(Qcow2State &qs,
-		const qcow2_io_ctx_t &ioc)
-{
-	unsigned cnt = 0;
-	for (int i = 0; i < get_nr_entries(); i++) {
-		u64 entry = get_entry(i);
-
-		if (entry) {
-			u64 cluster_off = entry & ((1ULL << 63) - 1);
-			 Qcow2ClusterState *s = qs.cluster_allocator.
-				 get_cluster_state(cluster_off);
-
-			if (s == nullptr)
-				continue;
-
-			if (s->get_state() < QCOW2_ALLOC_ZEROED) {
-				s->add_waiter(ioc.get_tag());
-				throw MetaUpdateException();
-			}
-		}
-	}
 }
 
 int Qcow2L2Table::flush(Qcow2State &qs, const qcow2_io_ctx_t &ioc,

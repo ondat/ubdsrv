@@ -55,16 +55,14 @@ u32 Qcow2State::get_l1_table_max_size()
 
 u32 Qcow2State::get_refcount_table_max_size()
 {
-	u32 blk_entry_bits = 1 << header.refcount_order;
 	u64 blk_size, res;
 
-	blk_size = ((1 << (header.cluster_bits + 3)) / blk_entry_bits) <<
-		header.cluster_bits;
+	blk_size = 1ULL << (2 * header.cluster_bits + 3 - header.refcount_order);
 	res = (header.get_size() + blk_size - 1) / blk_size;
 	res *= 8;
 
-	//qcow2_log("%s: cls bit %d, refcount_blk entry bits %d, blk_size %llu, ref tbl size %d\n",
-	//		__func__, header.cluster_bits, blk_entry_bits, blk_size, res);
+	//qcow2_log("%s: cls bit %d, refcount_order %d, blk_size %llu, ref tbl size %d\n",
+	//		__func__, header.cluster_bits, header.refcount_order, blk_size, res);
 	if (res < QCOW_MAX_REFTABLE_SIZE)
 		return round_up(res, 1UL << min_bs_bits);
 	return  QCOW_MAX_REFTABLE_SIZE;
@@ -91,6 +89,17 @@ u64 Qcow2State::get_refcount_table_offset()
 	return header.get_refcount_table_offset();
 }
 
+u32 Qcow2State::get_l2_slices_count()
+{
+	u32 mapping_bytes = get_dev_size() >> (header.cluster_bits - 3);
+
+	//align with qemu, at most 32MB
+	if (mapping_bytes > (32U << 20))
+		mapping_bytes = 32U << 20;
+
+	return mapping_bytes >> QCOW2_PARA::L2_TABLE_SLICE_BITS;
+}
+
 u32 Qcow2State::add_meta_io(u32 qid, Qcow2MappingMeta *m)
 {
 	struct meta_mapping *map = &meta_io_map[qid];
@@ -110,6 +119,42 @@ u32 Qcow2State::add_meta_io(u32 qid, Qcow2MappingMeta *m)
 	map->nr += 1;
 
 	return i;
+}
+
+bool Qcow2State::has_dirty_slice()
+{
+	return cluster_map.cache.has_dirty_slice(*this) ||
+		cluster_allocator.cache.has_dirty_slice(*this);
+}
+
+void Qcow2State::reclaim_slice(Qcow2SliceMeta *m)
+{
+	if (m->is_mapping_meta()) {
+		Qcow2L2Table *t =
+			static_cast<Qcow2L2Table *>(m);
+
+		cluster_map.cache.add_slice_to_reclaim_list(t);
+	} else {
+		Qcow2RefcountBlock *t =
+			static_cast<Qcow2RefcountBlock *>(m);
+
+		cluster_allocator.cache.add_slice_to_reclaim_list(t);
+	}
+}
+
+void Qcow2State::remove_slice_from_evicted_list(Qcow2SliceMeta *m)
+{
+	if (m->is_mapping_meta()) {
+		Qcow2L2Table *t =
+			static_cast<Qcow2L2Table *>(m);
+
+		cluster_map.cache.remove_slice_from_evicted_list(t);
+	} else {
+		Qcow2RefcountBlock *t =
+			static_cast<Qcow2RefcountBlock *>(m);
+
+		cluster_allocator.cache.remove_slice_from_evicted_list(t);
+	}
 }
 
 void Qcow2State::dump_meta()
@@ -135,6 +180,12 @@ void Qcow2State::kill_slices(struct ublksrv_queue *q)
 
 		m->put_ref();
 	}
+}
+
+void Qcow2State::shrink_cache()
+{
+	cluster_map.cache.shrink(*this);
+	cluster_allocator.cache.shrink(*this);
 }
 
 #ifdef DEBUG_QCOW2_META_VALIDATE
@@ -222,7 +273,12 @@ T *slice_cache<T>::alloc_slice(Qcow2State &state, const qcow2_io_ctx_t &ioc,
 		zero_buf = false;
 	}
 
-	t = new T(state, host_offset, parent_idx, flags);
+	t = pick_slice_from_reclaim_list();
+	if (t == nullptr)
+		t = new T(state, host_offset, parent_idx, flags);
+	else
+		t->reset(state, host_offset, parent_idx, flags);
+
 	if (t->get_dirty(-1))
 		state.meta_flushing.inc_dirtied_slice(t->is_mapping_meta());
 
@@ -295,14 +351,14 @@ void slice_cache<T>::add_slice_to_evicted_list(u64 virt_offset, T *t)
 
 template <class T>
 void slice_cache<T>::dump(Qcow2State &qs) {
-	unsigned long long start;
-	unsigned long long end = qs.get_dev_size();
+	auto lru_list = slices.get_lru_list_ro();
 
 	syslog(LOG_INFO, "cache size %u, dirty cache size %u\n",
 			slices.size(), evicted_slices.size());
-	for (start = 0; start <= end;
-			start += (1ULL << slice_virt_size_bits)) {
-		T *t = __find_slice(start, true);
+
+	//todo: use lrucache iterator to cut the loop time
+	for (auto it = lru_list.cbegin(); it != lru_list.cend(); ++it) {
+		T *t = it->second;
 
 		if (t)
 			t->dump();
@@ -341,16 +397,14 @@ int slice_cache<T>::figure_group_from_dirty_list(Qcow2State &qs) {
 template <class T>
 int slice_cache<T>::__figure_group_for_flush(Qcow2State &qs)
 {
-	unsigned long long start;
-	unsigned long long end = qs.get_dev_size();
 	std::unordered_map<u32, int> cnt;
 	int val = -1;
 	int idx = -1;
+	auto lru_list = slices.get_lru_list_ro();
 
 	//todo: use lrucache iterator to cut the loop time
-	for (start = 0; start <= end;
-			start += (1ULL << slice_virt_size_bits)) {
-		T *t = slices.__get(start);
+	for (auto it = lru_list.cbegin(); it != lru_list.cend(); ++it) {
+		T *t = it->second;
 
 		if (t != nullptr && t->get_dirty(-1) && !t->is_flushing()) {
 			u32 key = (t->parent_idx * 8) / 512;
@@ -386,6 +440,44 @@ int slice_cache<T>::figure_group_for_flush(Qcow2State &qs)
 	return __figure_group_for_flush(qs);
 }
 
+template <class T>
+bool slice_cache<T>::has_dirty_slice(Qcow2State &qs)
+{
+	auto lru_list = slices.get_lru_list_ro();
+
+	//todo: use lrucache iterator to cut the loop time
+	for (auto it = lru_list.cbegin(); it != lru_list.cend(); ++it) {
+		T *t = it->second;
+
+		if (t != nullptr && t->get_dirty(-1) && !t->is_flushing())
+			return true;
+	}
+
+	return has_evicted_dirty_slices();
+}
+
+template <class T>
+void slice_cache<T>::shrink(Qcow2State &qs)
+{
+	u32 cnt = qs.get_l2_slices_count();
+
+	for (auto it = reclaimed_slices.cbegin();
+			it != reclaimed_slices.cend(); ++it) {
+		delete *it;
+	}
+
+	reclaimed_slices.clear();
+
+	cnt >>= 3;
+
+	//shrink cache until 1/8 slices are kept
+	while (slices.size() > cnt) {
+		auto t = slices.remove_last();
+
+		delete t;
+	}
+}
+
 // refcount table shouldn't be so big
 Qcow2ClusterAllocator::Qcow2ClusterAllocator(Qcow2State &qs): state(qs),
 	cache(REFCOUNT_BLK_SLICE_BITS, qs.header.cluster_bits,
@@ -396,6 +488,11 @@ Qcow2ClusterAllocator::Qcow2ClusterAllocator(Qcow2State &qs): state(qs),
 {
 	max_alloc_states = 0;
 };
+
+Qcow2RefcountBlock* Qcow2ClusterAllocator::__find_slice(u64 key)
+{
+	return cache.__find_slice(key, true);
+}
 
 int Qcow2ClusterAllocator::figure_group_from_refcount_table()
 {
@@ -637,11 +734,16 @@ Qcow2ClusterMapping::Qcow2ClusterMapping(Qcow2State &qs): state(qs),
 	cache(QCOW2_PARA::L2_TABLE_SLICE_BITS,
 		qs.header.cluster_bits,
 		qs.header.cluster_bits + L2_TABLE_SLICE_BITS - 3,
-		QCOW2_PARA::L2_TABLE_MAX_CACHE_BYTES),
+		qs.get_l2_slices_count() * QCOW2_PARA::L2_TABLE_SLICE_BYTES),
 	cluster_bits(state.header.cluster_bits),
 	l2_entries_order(state.header.cluster_bits - 3),
 	max_alloc_entries(0)
 {
+}
+
+Qcow2L2Table* Qcow2ClusterMapping::__find_slice(u64 key, bool use_dirty)
+{
+	return cache.__find_slice(key, use_dirty);
 }
 
 int Qcow2ClusterMapping::figure_group_from_l1_table()
@@ -908,629 +1010,4 @@ void Qcow2ClusterMapping::dump_meta()
 			max_alloc_entries, entry_alloc.size());
 	state.l1_table.dump();
 	cache.dump(state);
-}
-
-MetaFlushingState::MetaFlushingState(Qcow2TopTable &t, bool is_mapping):
-	top(t), mapping(is_mapping)
-{
-	state = qcow2_meta_flush::IDLE;
-	slice_dirtied = 0;
-	parent_blk_idx = -1;
-	gettimeofday(&last_flush, NULL);
-}
-
-void MetaFlushingState::del_meta_from_list(std::vector <Qcow2SliceMeta *> &v,
-		const Qcow2SliceMeta *t)
-{
-	auto it = find(v.cbegin(), v.cend(), t);
-
-	qcow2_assert(it != v.cend());
-	v.erase(it);
-}
-
-void MetaFlushingState::slice_is_done(const Qcow2SliceMeta *t)
-{
-	del_meta_from_list(slices_in_flight, t);
-
-	qcow2_assert(state == WRITE_SLICES);
-
-	if (slices_in_flight.empty() && slices_to_flush.empty()) {
-		if (++parent_entry_idx >= (512/8))
-			set_state(qcow2_meta_flush::WRITE_TOP);
-		else
-			//handle next entry in this block of top table
-			set_state(qcow2_meta_flush::PREP_WRITE_SLICES);
-	}
-}
-
-void MetaFlushingState::add_slice_to_flush(Qcow2SliceMeta *m)
-{
-	qcow2_assert(state == PREP_WRITE_SLICES);
-	qcow2_assert(m->get_dirty(-1));
-
-	auto it = find(slices_to_flush.cbegin(), slices_to_flush.cend(), m);
-	qcow2_assert(it == slices_to_flush.cend());
-
-	auto it1 = find(slices_in_flight.cbegin(), slices_in_flight.cend(), m);
-	qcow2_assert(it1 == slices_in_flight.cend());
-
-	slices_to_flush.push_back(m);
-}
-
-co_io_job MetaFlushingState::__write_slice_co(Qcow2State &qs,
-		struct ublksrv_queue *q, Qcow2SliceMeta *m,
-		struct ublk_io *io, int tag)
-{
-	int ret;
-	qcow2_io_ctx_t ioc(tag, q->q_id);
-
-	slices_in_flight.push_back(m);
-again:
-	try {
-		ret = m->flush(qs, ioc, m->get_offset(), m->get_buf_size());
-	} catch (MetaUpdateException &meta_update_error) {
-		//co_io_job_submit_and_wait(tag);
-		goto again;
-	}
-
-	if (ret < 0) {
-		syslog(LOG_ERR, "%s: zero my cluster failed %d\n",
-				__func__, ret);
-		goto exit;
-	}
-
-	if (ret > 0) {
-		struct io_uring_cqe *cqe;
-		bool done = false;
-		int io_ret = 0;
-
-		co_io_job_submit_and_wait(tag);
-
-		cqe = io->tgt_io_cqe;
-		done = (cqe && cqe->res != -EAGAIN);
-		if (done)
-			io_ret = cqe->res;
-		ret = qcow2_meta_io_done(q, cqe);
-		if (!done && ret == -EAGAIN)
-			goto again;
-
-		//here we can't retry since the slice may be
-		//dirtied just after io_done()
-		if (!done) {
-			if (ret < 0)
-				goto exit;
-		} else {
-			if (io_ret < 0)
-				goto exit;
-			ret = io_ret;
-		}
-	}
-exit:
-	if (m->get_prep_flush()) {
-		m->set_prep_flush(false);
-		m->wakeup_all(q, tag);
-	}
-	qs.meta_flushing.free_tag(q, tag);
-	if (ret >= 0)
-		slice_is_done(m);
-	else
-		del_meta_from_list(slices_in_flight, m);
-	m->put_ref();
-}
-
-void MetaFlushingState::__write_slices(Qcow2State &qs,
-		struct ublksrv_queue *q)
-{
-	std::vector<Qcow2SliceMeta *> &v1 = slices_to_flush;
-	std::vector<Qcow2SliceMeta *>::const_iterator it = v1.cbegin();
-
-	flush_log("%s: mapping %d to_flush %d, in_flight %d\n",
-			__func__, mapping, v1.size(), slices_in_flight.size());
-
-	if (v1.empty())
-		return;
-
-	while (it != v1.cend()) {
-		int ret, tag;
-		struct ublk_io_tgt *io;
-		Qcow2SliceMeta *m;
-
-		tag = qs.meta_flushing.alloc_tag(q);
-		if (tag == -1)
-			return;
-		io = (struct ublk_io_tgt *)&q->ios[tag];
-		m = *it;
-		it = v1.erase(it);
-		m->get_ref();
-		io->co = __write_slice_co(qs, q, m, (struct ublk_io *)io, tag);
-	}
-}
-
-//todo: run fsync before flushing top table, and global fsync should be
-//fine, given top table seldom becomes dirty
-co_io_job MetaFlushingState::__write_top_co(Qcow2State &qs,
-		struct ublksrv_queue *q, struct ublk_io *io, int tag)
-{
-	int ret;
-	qcow2_io_ctx_t ioc(tag, q->q_id);
-
-again:
-	try {
-		ret = top.flush(qs, ioc,
-				top.get_offset() + parent_blk_idx * 512, 512);
-	} catch (MetaUpdateException &meta_update_error) {
-		//co_io_job_submit_and_wait(tag);
-		goto again;
-	}
-
-	if (ret < 0) {
-		syslog(LOG_ERR, "%s: zero my cluster failed %d\n",
-				__func__, ret);
-		goto exit;
-	}
-
-	if (ret > 0) {
-		struct io_uring_cqe *cqe;
-
-		co_io_job_submit_and_wait(tag);
-
-		cqe = io->tgt_io_cqe;
-		ret = qcow2_meta_io_done(q, cqe);
-		if (ret == -EAGAIN)
-			goto again;
-		if (ret < 0)
-			goto exit;
-	}
-exit:
-	qs.meta_flushing.free_tag(q, tag);
-
-	if (!top.get_blk_dirty(parent_blk_idx))
-		set_state(qcow2_meta_flush::DONE);
-}
-
-void MetaFlushingState::__write_top(Qcow2State &qs,
-		struct ublksrv_queue *q)
-{
-	int ret, tag;
-	struct ublk_io_tgt *io;
-
-	if (top.is_flushing(parent_blk_idx))
-		return;
-
-	tag = qs.meta_flushing.alloc_tag(q);
-	if (tag == -1)
-		return;
-
-	io = (struct ublk_io_tgt *)&q->ios[tag];
-	io->co = __write_top_co(qs, q, (struct ublk_io *)io, tag);
-}
-
-void MetaFlushingState::__done(Qcow2State &qs, struct ublksrv_queue *q)
-{
-	set_state(qcow2_meta_flush::IDLE);
-	gettimeofday(&last_flush, NULL);
-}
-
-void MetaFlushingState::mark_no_update()
-{
-	auto it = slices_to_flush.begin();
-
-	for (; it != slices_to_flush.end(); it++)
-		(*it)->set_prep_flush(true);
-}
-
-void MetaFlushingState::__prep_write_slice(Qcow2State &qs,
-		struct ublksrv_queue *q)
-{
-	u64 entry;
-	u64 idx = -1;
-	u64 start, end, offset, step;
-
-	do {
-		qcow2_assert(parent_entry_idx >= 0 && parent_entry_idx < (512/8));
-
-		idx = (parent_blk_idx * 512 / 8) + parent_entry_idx;
-
-		qcow2_assert(idx >= 0 && idx < top.get_nr_entries());
-
-		entry = top.get_entry(idx);
-		if (entry && top.has_dirty_slices(qs, idx))
-			break;
-
-		if (++parent_entry_idx == (512/8)) {
-			parent_entry_idx = 0;
-			set_state(qcow2_meta_flush::WRITE_TOP);
-			return;
-		}
-	} while (true);
-
-	if (mapping)
-		step = 1ULL << (QCOW2_PARA::L2_TABLE_SLICE_BITS - 3 +
-				qs.header.cluster_bits);
-	else
-		step = 1ULL << (QCOW2_PARA::REFCOUNT_BLK_SLICE_BITS - 3 +
-				qs.header.cluster_bits);
-
-	start = idx << top.single_entry_order();
-	end = start + (1ULL << top.single_entry_order());
-	for (offset = start; offset < end; offset += step) {
-		Qcow2SliceMeta *t;
-
-		if (mapping)
-			t = qs.cluster_map.__find_slice(offset);
-		else
-			t = qs.cluster_allocator.__find_slice(offset);
-
-		if (t && t->get_dirty(-1)) {
-			qcow2_assert(!t->is_flushing());
-			add_slice_to_flush(t);
-		}
-	}
-
-	if (slices_to_flush.size() > 0)
-		set_state(qcow2_meta_flush::ZERO_MY_CLUSTER);
-	else
-		set_state(qcow2_meta_flush::WRITE_TOP);
-}
-
-co_io_job MetaFlushingState::__zero_my_cluster_co(Qcow2State &qs,
-		struct ublksrv_queue *q, struct ublk_io *io, int tag,
-		Qcow2SliceMeta *m)
-
-{
-	int ret;
-	qcow2_io_ctx_t ioc(tag, q->q_id);
-	u64 cluster_off = m->get_offset() &
-		~((1ULL << qs.header.cluster_bits) - 1);
-
-again:
-	try {
-		ret = m->zero_my_cluster(qs, ioc);
-	} catch (MetaUpdateException &meta_update_error) {
-		//co_io_job_submit_and_wait(tag);
-		goto again;
-	}
-
-	if (ret < 0) {
-		syslog(LOG_ERR, "%s: zero my cluster failed %d\n",
-				__func__, ret);
-		goto exit;
-	}
-
-	if (ret > 0) {
-		struct io_uring_cqe *cqe;
-
-		co_io_job_submit_and_wait(tag);
-
-		cqe = io->tgt_io_cqe;
-		ret = qcow2_meta_io_done(q, cqe);
-		if (ret == -EAGAIN)
-			goto again;
-		if (ret < 0)
-			goto exit;
-	}
-exit:
-	qs.meta_flushing.free_tag(q, tag);
-	if (qs.cluster_allocator.alloc_cluster_is_zeroed(cluster_off)) {
-		//for mapping table, wait until the associated refcount
-		//tables are flushed out
-		if (mapping) {
-			mark_no_update();
-			set_state(qcow2_meta_flush::WAIT);
-		} else
-			set_state(qcow2_meta_flush::WRITE_SLICES);
-	}
-	m->put_ref();
-}
-
-
-void MetaFlushingState::__zero_my_cluster(Qcow2State &qs,
-		struct ublksrv_queue *q)
-{
-	int ret, tag;
-	struct ublk_io_tgt *io;
-	Qcow2SliceMeta *m = slices_to_flush[0];
-	u64 cluster_off = m->get_offset() &
-		~((1ULL << qs.header.cluster_bits) - 1);
-	Qcow2ClusterState *s =
-		qs.cluster_allocator.get_cluster_state(cluster_off);
-
-	if (s != nullptr && s->get_state() == QCOW2_ALLOC_ZEROING)
-		return;
-
-	tag = qs.meta_flushing.alloc_tag(q);
-	if (tag == -1)
-		return;
-
-	m->get_ref();
-	io = (struct ublk_io_tgt *)&q->ios[tag];
-	io->co = __zero_my_cluster_co(qs, q, (struct ublk_io *)io, tag, m);
-}
-
-void MetaFlushingState::run_flush(Qcow2State &qs,
-		struct ublksrv_queue *q, int top_blk_idx)
-{
-	if (state == qcow2_meta_flush::IDLE) {
-		if (top_blk_idx >= 0 && top_blk_idx < top.dirty_blk_size()) {
-			parent_blk_idx = top_blk_idx;
-			parent_entry_idx = 0;
-			set_state(qcow2_meta_flush::PREP_WRITE_SLICES);
-		}
-	}
-again:
-	if (state == qcow2_meta_flush::PREP_WRITE_SLICES)
-		__prep_write_slice(qs, q);
-
-	if (state == qcow2_meta_flush::ZERO_MY_CLUSTER)
-		__zero_my_cluster(qs, q);
-
-	if (state == qcow2_meta_flush::WAIT) {
-		qcow2_assert(mapping);
-		return;
-	}
-
-	if (state == qcow2_meta_flush::WRITE_SLICES)
-		__write_slices(qs, q);
-
-	if (state == qcow2_meta_flush::WRITE_TOP)
-		__write_top(qs, q);
-
-	if (state == qcow2_meta_flush::DONE)
-		__done(qs, q);
-
-	if (state == qcow2_meta_flush::PREP_WRITE_SLICES)
-		goto again;
-}
-
-void MetaFlushingState::dump(const char *func, int line) const {
-	qcow2_log("%s %d: mapping %d state %d blk_idx %d entry_idx %d list size(%d %d)"
-			" dirty slices %u, top table dirty blocks %u\n",
-			func, line, mapping, state,
-			parent_blk_idx, parent_entry_idx,
-			slices_to_flush.size(),
-			slices_in_flight.size(),
-			slice_dirtied, top.dirty_blks());
-}
-
-bool MetaFlushingState::__need_flush(int queued)
-{
-	bool need_flush = slice_dirtied > 0;
-
-	if (!need_flush)
-		need_flush = top.dirty_blks() > 0;
-
-	if (!need_flush)
-		return false;
-
-	if (queued) {
-		struct timeval t;
-
-		gettimeofday(&t, NULL);
-
-		//timeout, so flush now
-		if (usec_diff(&t, &last_flush) > MAX_META_FLUSH_DELAY)
-			return true;
-		else
-			return false;
-	}
-
-	/* queue is idle, so have to flush immediately */
-	return true;
-}
-
-bool MetaFlushingState::need_flush(Qcow2State &qs, int *top_idx,
-		unsigned queued)
-{
-	bool need_flush = get_state() > qcow2_meta_flush::IDLE;
-	int idx = -1;
-
-	if (!need_flush) {
-		if (mapping)
-			need_flush = qs.cluster_map.
-				has_evicted_dirty_slices();
-		else
-			need_flush = qs.cluster_allocator.
-				has_evicted_dirty_slices();
-
-		//only flush refcount tables actively if there
-		//are evicted dirty refcount slices
-		if (!need_flush)
-			need_flush = __need_flush(queued);
-	}
-
-	if (need_flush && get_state() == qcow2_meta_flush::IDLE) {
-		if (mapping)
-			idx = qs.cluster_map.figure_group_from_l1_table();
-		else
-			idx = qs.cluster_allocator.figure_group_from_refcount_table();
-
-		//idx is more accurate than slice_dirtied
-		//FIXME: make slice_dirtied more accurate
-		if (idx == -1) {
-			need_flush = false;
-			slice_dirtied = 0;
-		}
-	}
-
-	*top_idx = idx;
-	return need_flush;
-}
-
-//calculate the 1st index of refcount table, in which the to-be-flushed
-//l2's entries depend on
-int MetaFlushingState::calc_refcount_dirty_blk_range(Qcow2State& qs,
-			int *refcnt_blk_start, int *refcnt_blk_end)
-{
-	u64 s = (u64)-1;
-	u64 e = 0;
-	u64 l2_offset = 0;
-	int start_idx, end_idx;
-
-	qcow2_assert(mapping);
-
-	for (auto it = slices_to_flush.begin(); it != slices_to_flush.end();
-			it++) {
-		u64 ts, te;
-
-		qcow2_assert((*it)->get_dirty(-1));
-
-		(*it)->get_dirty_range(&ts, &te);
-
-		if (!l2_offset)
-			l2_offset = (*it)->get_offset() & ~((1ULL <<
-					qs.header.cluster_bits) - 1);
-
-		if (ts > te)
-			continue;
-		if (ts < s)
-			s = ts;
-		if (te > e)
-			e = te;
-	}
-
-	if (s > e)
-		return -EINVAL;
-
-	//this l2 should be considered too
-	if (l2_offset && l2_offset < s)
-		s = l2_offset;
-
-	start_idx = qs.refcount_table.offset_to_idx(s);
-	*refcnt_blk_start = start_idx >> (qs.get_min_flush_unit_bits() - 3);
-
-	end_idx = qs.refcount_table.offset_to_idx(e);
-	*refcnt_blk_end = end_idx >> (qs.get_min_flush_unit_bits() - 3);
-	*refcnt_blk_end += 1;
-
-	flush_log("%s: %lx-%lx idx (%d %d) blk idx(%d %d)\n", __func__, s, e,
-			start_idx, end_idx, *refcnt_blk_start, *refcnt_blk_end);
-
-	if (*refcnt_blk_start == *refcnt_blk_end)
-		*refcnt_blk_end = *refcnt_blk_start + 1;
-
-	if (*refcnt_blk_start >= *refcnt_blk_end)
-		qcow2_log("%s: %lx-%lx bad idx %d %d\n", __func__, s, e,
-				*refcnt_blk_start, *refcnt_blk_end);
-
-	qcow2_assert(*refcnt_blk_start < *refcnt_blk_end);
-
-	return 0;
-}
-
-Qcow2MetaFlushing::Qcow2MetaFlushing(Qcow2State &qs): state(qs),
-	tags(QCOW2_PARA::META_MAX_TAGS), mapping_stat(qs.l1_table, true),
-	refcount_stat(qs.refcount_table, false),
-	refcnt_blk_start(-1),
-	refcnt_blk_end(-1)
-{
-	for (int i = 0; i < tags.size(); i++)
-		tags[i] = true;
-}
-
-int Qcow2MetaFlushing::alloc_tag(struct ublksrv_queue *q) {
-	for (size_t i = 0; i < tags.size(); i++) {
-		if (tags[i]) {
-			tags[i] = false;
-			return i + q->q_depth;
-		}
-	}
-	return -1;
-}
-
-void Qcow2MetaFlushing::free_tag(struct ublksrv_queue *q, int tag) {
-	int depth = q->q_depth;
-
-	qcow2_assert(tag >= depth && tag < depth + tags.size());
-	tags[tag - depth] = true;
-}
-
-void Qcow2MetaFlushing::dump()
-{
-	syslog(LOG_ERR, "meta flushing: mapping: dirty slices %u, l1 dirty blocks %u\n",
-			mapping_stat.slice_dirtied,
-			state.l1_table.dirty_blks());
-	syslog(LOG_ERR, "meta flushing: refcount: dirty slices %u, refcount table dirty blocks %u\n",
-			refcount_stat.slice_dirtied,
-			state.refcount_table.dirty_blks());
-}
-
-bool Qcow2MetaFlushing::handle_mapping_dependency_start_end(Qcow2State *qs,
-		struct ublksrv_queue *q)
-{
-	if (refcount_stat.get_state() == qcow2_meta_flush::IDLE &&
-			(refcnt_blk_start == refcnt_blk_end)) {
-		int ret;
-
-		//current flushing refcnt is done
-		if (refcnt_blk_start >= 0) {
-			mapping_stat.set_state(
-					qcow2_meta_flush::WRITE_SLICES);
-			refcnt_blk_start = refcnt_blk_end = -1;
-			mapping_stat.run_flush(state, q, -1);
-
-			return true;
-		} else { //current flushing is just started
-			ret = mapping_stat.calc_refcount_dirty_blk_range(
-					*qs, &refcnt_blk_start, &refcnt_blk_end);
-
-			if (ret < 0) {
-				mapping_stat.set_state(
-					qcow2_meta_flush::WRITE_SLICES);
-				mapping_stat.run_flush(state, q, -1);
-				return true;
-			}
-		}
-	}
-
-	return false;
-}
-
-void Qcow2MetaFlushing::handle_mapping_dependency(Qcow2State *qs,
-		struct ublksrv_queue *q)
-{
-	qcow2_assert(mapping_stat.get_state() == qcow2_meta_flush::WAIT);
-
-	if (!handle_mapping_dependency_start_end(qs, q)) {
-
-		refcount_stat.run_flush(state, q, refcnt_blk_start);
-
-		while (refcount_stat.get_state() == qcow2_meta_flush::IDLE &&
-				(++refcnt_blk_start < refcnt_blk_end))
-			refcount_stat.run_flush(state, q, refcnt_blk_start);
-		handle_mapping_dependency_start_end(qs, q);
-	}
-
-	if (mapping_stat.get_state() != qcow2_meta_flush::WAIT)
-		mapping_stat.run_flush(state, q, -1);
-}
-
-void Qcow2MetaFlushing::run_flush(struct ublksrv_queue *q, int queued)
-{
-	Qcow2State *qs = dev_to_qcow2state(q->dev);
-	bool need_flush;
-	int map_idx = -1;
-	int refcnt_idx = -1;
-
-	need_flush = mapping_stat.need_flush(*qs, &map_idx, queued);
-	need_flush |= refcount_stat.need_flush(*qs, &refcnt_idx, queued);
-
-	if (need_flush)
-		flush_log("%s: enter flush: state %d/%d top blk idx %d/%d queued %d, refcnt blks(%d %d)\n",
-			__func__, mapping_stat.get_state(),
-			refcount_stat.get_state(), map_idx, refcnt_idx,
-			queued, refcnt_blk_start, refcnt_blk_end);
-
-	//refcount tables flushing is always triggered by flushing mapping
-	//tables
-	if (need_flush)
-		mapping_stat.run_flush(state, q, map_idx);
-
-	if (mapping_stat.get_state() == qcow2_meta_flush::WAIT)
-		handle_mapping_dependency(qs, q);
-
-	if (need_flush)
-		flush_log("%s: exit flush: state %d/%d queued %d refcnt blks(%d %d)\n",
-			__func__, mapping_stat.get_state(),
-			refcount_stat.get_state(), queued,
-			refcnt_blk_start, refcnt_blk_end);
 }
