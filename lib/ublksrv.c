@@ -2,10 +2,13 @@
 
 #include <config.h>
 #include <sys/mman.h>
-#include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/time.h>
 
+// This must come before
 #include "ublksrv_priv.h"
+
+// This must come after
 #include "ublksrv_aio.h"
 
 static inline struct ublksrv_io_desc *ublksrv_get_iod(
@@ -916,11 +919,27 @@ int ublksrv_process_io(const struct ublksrv_queue *tq)
 	if (ublksrv_queue_is_done(q))
 		return -ENODEV;
 
+#if 1
+	// EDIT: We're running in an epoll loop so exit immediately if there isn't any
+	// work immediately available.
+	struct __kernel_timespec ts2 = {
+		.tv_sec = 0,
+		.tv_nsec = 0
+        };
+	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, &ts2, NULL);
+#else
 	ret = io_uring_submit_and_wait_timeout(&q->ring, &cqe, 1, tsp, NULL);
+#endif
 
 	ublksrv_reset_aio_batch(q);
 	reapped = ublksrv_reap_events_uring(&q->ring);
 	ublksrv_submit_aio_batch(q);
+
+#if 1
+	// Calling ublksrv_reap_events_uring can cause us to enqueue more sqes which
+	// we need to submit.
+	ret = io_uring_submit(&q->ring);
+#endif
 
 	if (q->tgt_ops->handle_io_background)
 		q->tgt_ops->handle_io_background(local_to_tq(q),
