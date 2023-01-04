@@ -906,8 +906,10 @@ int ublksrv_process_io(const struct ublksrv_queue *tq)
 		.tv_sec = UBLKSRV_IO_IDLE_SECS,
 		.tv_nsec = 0
         };
+#if 0
 	struct __kernel_timespec *tsp = (q->state & UBLKSRV_QUEUE_IDLE) ?
 		NULL : &ts;
+#endif
 	struct io_uring_cqe *cqe;
 
 	ublksrv_log(LOG_INFO, "dev%d-q%d: to_submit %d inflight %u/%u stopping %d\n",
