@@ -584,8 +584,15 @@ skip_alloc_buf:
 		//ublk_assert(io_data_size ^ (unsigned long)q->ios[i].data.private_data);
 	}
 
+	// Breaks if we intend on one thread calling queue_init(), but another
+	// thread actually utilising the ring. Maybe be possible to work around
+	// this by using IORING_SETUP_R_DISABLED
+#if 0
 	ret = ublksrv_setup_ring(&q->ring, ring_depth, cq_depth,
 			IORING_SETUP_SQE128 | IORING_SETUP_COOP_TASKRUN);
+#else
+	ret = ublksrv_setup_ring(&q->ring, ring_depth, cq_depth, IORING_SETUP_SQE128);
+#endif
 	if (ret < 0) {
 		ublk_err("ublk dev %d queue %d setup io_uring failed %d",
 				q->dev->ctrl_dev->dev_info.dev_id, q->q_id, ret);
@@ -593,7 +600,13 @@ skip_alloc_buf:
 	}
 
 	q->ring_ptr = &q->ring;
+
+	// Breaks if we intend on one thread calling queue_init(), but another
+	// thread actually utilising the ring. Maybe be possible to work around
+	// this by using IORING_SETUP_R_DISABLED
+#if 0
 	io_uring_register_ring_fd(&q->ring);
+#endif
 
 	ret = io_uring_register_files(&q->ring, dev->tgt.fds,
 			dev->tgt.nr_fds + 1);
